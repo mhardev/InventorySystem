@@ -1,0 +1,263 @@
+<?php
+
+namespace Illuminate\Foundation\Auth;
+
+use App\Models\Audittrail;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Event;
+use RealRashid\SweetAlert\Facades\Alert;
+use Illuminate\Validation\ValidationException;
+
+trait AuthenticatesUsers
+{
+    use RedirectsUsers, ThrottlesLogins;
+
+    /**
+     * Show the application's login form.
+     *
+     * @return \Illuminate\View\View
+     */
+    public function showLoginForm()
+    {
+        return view('auth.login');
+    }
+
+    /**
+     * Handle a login request to the application.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\RedirectResponse|\Illuminate\Http\Response|\Illuminate\Http\JsonResponse
+     *
+     * @throws \Illuminate\Validation\ValidationException
+     */
+    public function login(Request $request)
+    {
+        $this->validateLogin($request);
+
+        // If the class is using the ThrottlesLogins trait, we can automatically throttle
+        // the login attempts for this application. We'll key this by the username and
+        // the IP address of the client making these requests into this application.
+        if (method_exists($this, 'hasTooManyLoginAttempts') &&
+            $this->hasTooManyLoginAttempts($request)) {
+            $this->fireLockoutEvent($request);
+
+            return $this->sendLockoutResponse($request);
+        }
+
+        if ($this->attemptLogin($request)) {
+            if ($request->hasSession()) {
+                $request->session()->put('auth.password_confirmed_at', time());
+            }
+
+            return $this->sendLoginResponse($request);
+        }
+
+        // If the login attempt was unsuccessful we will increment the number of attempts
+        // to login and redirect the user back to the login form. Of course, when this
+        // user surpasses their maximum number of attempts they will get locked out.
+        $this->incrementLoginAttempts($request);
+
+        return $this->sendFailedLoginResponse($request);
+    }
+
+    /**
+     * Validate the user login request.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return void
+     *
+     * @throws \Illuminate\Validation\ValidationException
+     */
+    protected function validateLogin(Request $request)
+    {
+        $request->validate([
+            $this->username() => 'required|string',
+            'password' => 'required|string',
+        ]);
+    }
+
+    /**
+     * Attempt to log the user into the application.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return bool
+     */
+    protected function attemptLogin(Request $request)
+    {
+        return $this->guard()->attempt(
+            $this->credentials($request), $request->filled('remember')
+        );
+    }
+
+    /**
+     * Get the needed authorization credentials from the request.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return array
+     */
+    protected function credentials(Request $request)
+    {
+        return $request->only($this->username(), 'password');
+    }
+
+    /**
+     * Send the response after the user was authenticated.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\RedirectResponse|\Illuminate\Http\JsonResponse
+     */
+    protected function sendLoginResponse(Request $request)
+    {
+        $request->session()->regenerate();
+
+        $this->clearLoginAttempts($request);
+
+        if ($response = $this->authenticated($request, $this->guard()->user())) {
+            return $response;
+        }
+
+        // Record audit log for successful login
+        $this->recordAuditLog($request->user());
+
+        return $request->wantsJson()
+                    ? new JsonResponse([], 204)
+                    : redirect()->intended($this->redirectPath());
+    }
+
+    /**
+     * Record the audit log for successful login.
+     *
+     * @param  mixed  $user
+     * @return void
+     */
+    protected function recordAuditLog($user)
+    {
+        $auditlog = new Audittrail;
+        $auditlog->user_id = $user->id;
+        $auditlog->user_type = $user->role_as == 1 ? 'Admin' : 'User';
+        $auditlog->activity_name = 'Logged in';
+        $auditlog->activity_details = 'Logging in user.';
+        $auditlog->save();
+    }
+
+    /**
+     * The user has been authenticated.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @param  mixed  $user
+     * @return mixed
+     */
+    protected function authenticated(Request $request, $user)
+    {
+        //
+    }
+
+    /**
+     * Get the failed login response instance.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Symfony\Component\HttpFoundation\Response
+     *
+     * @throws \Illuminate\Validation\ValidationException
+     */
+    protected function sendFailedLoginResponse(Request $request)
+    {
+        throw ValidationException::withMessages([
+            $this->username() => [trans('auth.failed')],
+        ]);
+    }
+
+    /**
+     * Get the login username to be used by the controller.
+     *
+     * @return string
+     */
+    public function username()
+    {
+        return 'email';
+    }
+
+    /**
+     * Log the user out of the application.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\RedirectResponse|\Illuminate\Http\JsonResponse
+     */
+    public function logout(Request $request)
+    {
+        $user = $request->user();
+
+        $this->guard()->logout();
+
+        $request->session()->invalidate();
+
+        $request->session()->regenerateToken();
+
+        // Record audit log for logout
+        $this->recordLogoutAuditLog($user);
+
+        if ($response = $this->loggedOut($request)) {
+            return $response;
+        }
+
+        return $request->wantsJson()
+            ? new JsonResponse([], 204)
+            : redirect('/');
+    }
+
+    /**
+     * Record the audit log for logout.
+     *
+     * @param  mixed  $user
+     * @return void
+     */
+    protected function recordLogoutAuditLog($user)
+    {
+        if ($user->role_as == '1') {
+            $auditlog = new Audittrail;
+            $auditlog->user_id = $user->id;
+            $auditlog->user_type = 'Admin';
+            $auditlog->activity_name = 'Logged out';
+            $auditlog->activity_details = 'Logging-out admin.';
+            $auditlog->save();
+        } elseif ($user->role_as == '0') {
+            $auditlog = new Audittrail;
+            $auditlog->user_id = $user->id;
+            $auditlog->user_type = 'User';
+            $auditlog->activity_name = 'Logged out';
+            $auditlog->activity_details = 'Logging-out user.';
+            $auditlog->save();
+        }
+        return redirect('/login')->with('message','Logged out successfully');
+    }
+
+    /**
+     * The user has logged out of the application.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return mixed
+     */
+    protected function loggedOut(Request $request)
+    {
+        //
+    }
+
+    /**
+     * Get the guard to be used during authentication.
+     *
+     * @return \Illuminate\Contracts\Auth\StatefulGuard
+     */
+    protected function guard()
+    {
+        return Auth::guard();
+    }
+}
+
+command for single table:
+php artisan migrate --path=database/migrations/2020_04_10_130703_create_test_table.php
+
+SELECT a.user_id,c.name,a.product_id,b.item_name,count(*) as 'Quantity',a.status FROM `itemrequest` as a LEFT JOIN itemproducts as b on a.product_id = b.id LEFT JOIN users as c on a.user_id = c.id where a.user_id = '10' group by a.product_id,a.user_id;
+
+SELECT a.user_id,c.name,a.product_id,b.item_name,count(*) as 'Quantity',a.status FROM `itemrequest` as a LEFT JOIN itemproducts as b on a.product_id = b.id LEFT JOIN users as c on a.user_id = c.id where a.user_id = '1' group by a.product_id,a.user_id;
